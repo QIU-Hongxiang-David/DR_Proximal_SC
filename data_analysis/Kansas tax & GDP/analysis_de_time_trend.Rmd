@@ -1,0 +1,540 @@
+---
+title: "Kansas 2012 tax"
+output: pdf_document
+---
+
+```{r}
+knitr::opts_chunk$set(cache=TRUE)
+library(magrittr)
+library(tidyverse)
+library(gmm)
+library(Synth)
+library(splines)
+library(scales)
+library(ggplot2)
+library(ggpubr)
+library(augsynth)
+#install augsynth by running
+#devtools::install_github("ebenmichael/augsynth")
+
+data("kansas")
+kansas%<>%mutate(t=(year-1990)*4+qtr)
+```
+
+# Effect on lngdpcapita
+
+```{r}
+excluded<-NULL
+d1<-kansas%>%select(fips,state,t,lngdpcapita)
+model<-lm(lngdpcapita~poly(t,2),data=d1%>%filter(state!="Kansas"))
+d1%<>%mutate(lngdpcapita.resid=lngdpcapita-predict(model,newdata=d1))
+
+Y<-d1%>%filter(state=="Kansas")%>%pull(lngdpcapita.resid)
+
+t.shift<-0
+T<-n_distinct(d1$t)
+t<-1:T
+T0<-(2012-1990)*4+1
+
+
+DR<-function(data,vcovfun=c("vcovHAC","NeweyWest")){
+    vcovfun<-match.arg(vcovfun)
+    
+    T<-data$T
+    T0<-data$T0
+    t<-data$t
+    nW<-ncol(data$W)
+    nZ<-ncol(data$Z[,Z.states,drop=FALSE])
+    
+    evalh<-function(theta,data){
+        as.numeric(cbind(1,data$W)%*%theta[1:(nW+1)])
+    }
+    evalq<-function(theta,data){
+        as.numeric(exp(cbind(1,data$Z[,Z.states,drop=FALSE])%*%theta[(nW+2):(nW+nZ+2)]))
+    }
+    gh<-cbind(1,data$Z)
+    ngh<-ncol(gh)
+    gq<-cbind(1,data$W)
+    ngq<-ncol(gq)
+    
+    g<-function(theta,data){
+        h<-evalh(theta,data)
+        q<-evalq(theta,data)
+        
+        g1<-(t<=T0)*(data$Y-h)*gh
+        g2<-(t>T0)*(matrix(theta[(nW+nZ+3):(nW+nZ+ngq+2)],nrow=T,ncol=ngq,byrow=TRUE)-gq)
+        g3<-(t<=T0)*(q*gq-matrix(theta[(nW+nZ+3):(nW+nZ+ngq+2)],nrow=T,ncol=ngq,byrow=TRUE))
+        g4<-(t>T0)*(theta[nW+nZ+ngq+3]-(data$Y-h)+theta[nW+nZ+ngq+4])
+        g5<-(t<=T0)*(theta[nW+nZ+ngq+4]-q*(data$Y-h))
+        
+        cbind(g1,g2,g3,g4,g5)
+    }
+    
+    gradv<-function(theta,data){
+        h<-evalh(theta,data)
+        q<-evalq(theta,data)
+        
+        out<-matrix(0,ngh+2*ngq+2,nW+nZ+ngq+4)
+        
+        #g1
+        out[1:ngh,1:(nW+1)]<--t(gh)%*%(cbind(1,data$W)*(t<=T0))/T
+        
+        #g2
+        out[(ngh+1):(ngh+ngq),(nW+nZ+3):(nW+nZ+ngq+2)]<-diag((T-T0)/T,ngq)
+        
+        #g3
+        out[(ngh+ngq+1):(ngh+2*ngq),(nW+nZ+3):(nW+nZ+ngq+2)]<-diag(-T0/T,ngq)
+        M1<-t(gq)
+        M2<-q*(t<=T0)*cbind(1,data$Z[,Z.states,drop=FALSE])/T
+        out[(ngh+ngq+1):(ngh+2*ngq),(nW+2):(nW+nZ+2)]<-M1%*%M2
+        
+        #g4
+        out[ngh+2*ngq+1,nW+nZ+ngq+3]<-out[ngh+2*ngq+1,nW+nZ+ngq+4]<-(T-T0)/T
+        out[ngh+2*ngq+1,1:(nW+1)]<-colMeans(cbind(1,data$W)*(t>T0))
+        
+        #g5
+        out[ngh+2*ngq+2,nW+nZ+ngq+4]<-T0/T
+        out[ngh+2*ngq+2,1:(nW+1)]<-colMeans(q*cbind(1,data$W)*(t<=T0))
+        out[ngh+2*ngq+2,(nW+2):(nW+nZ+2)]<-colMeans(-q*(data$Y-h)*cbind(1,data$Z[,Z.states,drop=FALSE])*(t<=T0))
+        
+        out
+    }
+    
+    init.model.h<-lm(data$Y~.,data=as.data.frame(data$W),subset=t<=T0)
+    init.alpha<-coef(init.model.h)
+    
+    init.model.q<-glm(I(t>T0)~.,data=as.data.frame(data$Z[,Z.states,drop=FALSE]),family=binomial())
+    init.beta<-coef(init.model.q)
+    init.beta[1]<-init.beta[1]+log((T-T0)/T0)
+    
+    init.psi<-colMeans(gq[t>T0,,drop=FALSE])
+    init.psi.minus<-mean(exp(cbind(1,data$Z[t<=T0,Z.states,drop=FALSE])%*%init.beta)*(data$Y[t<=T0]-predict(init.model.h,newdata=as.data.frame(data$W[t<=T0,,drop=FALSE]))))
+    init.phi<-mean(data$Y[t>T0]-predict(init.model.h,newdata=as.data.frame(data$W[t>T0,,drop=FALSE])))-init.psi.minus
+    theta0<-c(init.alpha,init.beta,init.psi,init.phi,init.psi.minus)
+    
+    names(theta0)<-c(paste0("alpha",0:nW),paste0("beta",0:nZ),paste0("psi",1:ngq),"phi","psi-")
+    
+    model<-gmm(g=g,x=data,t0=theta0,gradv=gradv,wmatrix="ident",control=list(maxit=1e5),method="BFGS",vcov="iid")
+    cat("Parameter estimate:\n")
+    print(coef(model))
+    cat("Summary of estimated q(Zt):\n")
+    print(summary(evalq(coef(model),data)[t<=T0]))
+    
+    phi.hat=coef(model)["phi"]
+    
+    #vcov HAC
+    var<-if(vcovfun=="vcovHAC"){
+        sandwich::vcovHAC(model)
+    }else{
+        sandwich::NeweyWest(model,prewhite=FALSE)
+    }
+    rownames(var)<-colnames(var)<-names(theta0)
+    SE<-sqrt(var["phi","phi"])
+    CI<-phi.hat+qnorm(c(.025,.975))*SE
+    
+    SC<-evalh(coef(model),data)
+    
+    list(phi.hat=phi.hat,SE=SE,CI=CI,convergence=model$algoInfo$convergence,SC=SC)
+}
+
+PI.h<-function(data,vcovfun=c("vcovHAC","NeweyWest")){
+    vcovfun<-match.arg(vcovfun)
+    
+    T<-data$T
+    T0<-data$T0
+    t<-data$t
+    nW<-ncol(data$W)
+    
+    evalh<-function(theta,data){
+        as.numeric(cbind(1,data$W)%*%theta[1:(nW+1)])
+    }
+    gh<-cbind(1,data$Z)
+    ngh<-ncol(gh)
+    
+    g<-function(theta,data){
+        h<-evalh(theta,data)
+        
+        g1<-T/T0*(t<=T0)*(data$Y-h)*gh
+        g2<-(t>T0)*(theta[nW+2]-(data$Y-h))
+        
+        cbind(g1,g2)
+    }
+    
+    gradv<-function(theta,data){
+        h<-evalh(theta,data)
+        
+        out<-matrix(0,ngh+1,nW+2)
+        
+        #g1
+        out[1:ngh,1:(nW+1)]<--t(gh)%*%(cbind(1,data$W)*(t<=T0))/T0
+        
+        #g2
+        out[ngh+1,nW+2]<-(T-T0)/T
+        out[ngh+1,1:(nW+1)]<-colMeans((t>T0)*cbind(1,data$W))
+        
+        out
+    }
+    
+    init.model.h<-lm(data$Y~.,data=as.data.frame(data$W),subset=t<=T0)
+    init.alpha<-coef(init.model.h)
+    init.phi<-mean(data$Y[t>T0]-predict(init.model.h,newdata=as.data.frame(data$W[t>T0,,drop=FALSE])))
+    theta0<-c(init.alpha,init.phi)
+    
+    names(theta0)<-c(paste0("alpha",0:nW),"phi")
+    
+    model<-gmm(g=g,x=data,t0=theta0,gradv=gradv,wmatrix="ident",control=list(maxit=1e5),method="BFGS",vcov="iid")
+    cat("Parameter estimate:\n")
+    print(coef(model))
+    
+    phi.hat=coef(model)["phi"]
+    
+    #vcov HAC
+    var<-if(vcovfun=="vcovHAC"){
+        sandwich::vcovHAC(model)
+    }else{
+        sandwich::NeweyWest(model,prewhite=FALSE)
+    }
+    rownames(var)<-colnames(var)<-names(theta0)
+    SE<-sqrt(var["phi","phi"])
+    CI<-phi.hat+qnorm(c(.025,.975))*SE
+    
+    
+    SC<-evalh(coef(model),data)
+    
+    list(phi.hat=phi.hat,SE=SE,CI=CI,convergence=model$algoInfo$convergence,SC=SC)
+}
+
+
+
+PI.q<-function(data,vcovfun=c("vcovHAC","NeweyWest")){
+    vcovfun<-match.arg(vcovfun)
+    
+    T<-data$T
+    T0<-data$T0
+    t<-data$t
+    nZ<-ncol(data$Z[,Z.states,drop=FALSE])
+    
+    evalq<-function(theta,data){
+        as.numeric(exp(cbind(1,data$Z[,Z.states,drop=FALSE])%*%theta[1:(nZ+1)]))
+    }
+    gq<-cbind(1,data$W)
+    ngq<-ncol(gq)
+    
+    g<-function(theta,data){
+        q<-evalq(theta,data)
+        
+        g1<-(t>T0)*(matrix(theta[(nZ+2):(nZ+ngq+1)],nrow=T,ncol=ngq,byrow=TRUE)-gq)
+        g2<-(t<=T0)*(q*gq-matrix(theta[(nZ+2):(nZ+ngq+1)],nrow=T,ncol=ngq,byrow=TRUE))
+        g3<-(t>T0)*(theta[nZ+ngq+2]-data$Y+theta[nZ+ngq+3])
+        g4<-(t<=T0)*(theta[nZ+ngq+3]-q*data$Y)
+        
+        cbind(g1,g2,g3,g4)
+    }
+    
+    gradv<-function(theta,data){
+        q<-evalq(theta,data)
+        
+        out<-matrix(0,2*ngq+2,nZ+ngq+3)
+        
+        #g1
+        out[1:ngq,(nZ+2):(nZ+ngq+1)]<-diag((T-T0)/T,ngq)
+        
+        #g2
+        out[(ngq+1):(2*ngq),(nZ+2):(nZ+ngq+1)]<-diag(-T0/T,ngq)
+        M1<-t(gq)
+        M2<-q*(t<=T0)*cbind(1,data$Z[,Z.states,drop=FALSE])/T
+        out[(ngq+1):(2*ngq),1:(nZ+1)]<-M1%*%M2
+        
+        #g3
+        out[2*ngq+1,nZ+ngq+2]<-out[2*ngq+1,nZ+ngq+3]<-(T-T0)/T
+        
+        #g4
+        out[2*ngq+2,nZ+ngq+3]<-T0/T
+        out[2*ngq+2,1:(nZ+1)]<-colMeans(-q*data$Y*cbind(1,data$Z[,Z.states,drop=FALSE])*(t<=T0))
+        
+        out
+    }
+    
+    init.model.q<-glm(I(t>T0)~.,data=as.data.frame(data$Z[,Z.states,drop=FALSE]),family=binomial())
+    init.beta<-coef(init.model.q)
+    init.beta[1]<-init.beta[1]+log((T-T0)/T0)
+    init.psi<-colMeans(gq[t>T0,,drop=FALSE])
+    init.psi.minus<-mean(exp(cbind(1,data$Z[t<=T0,Z.states,drop=FALSE])%*%init.beta)*data$Y[t<=T0])
+    init.phi<-mean(data$Y[t>T0])-init.psi.minus
+    theta0<-c(init.beta,init.psi,init.phi,init.psi.minus)
+    
+    names(theta0)<-c(paste0("beta",0:nZ),paste0("psi",1:ngq),"phi","psi-")
+    
+    model<-gmm(g=g,x=data,t0=theta0,gradv=gradv,wmatrix="ident",control=list(maxit=1e5),method="BFGS",vcov="iid")
+    cat("Parameter estimate:\n")
+    print(coef(model))
+    cat("Summary of estimated q(Zt):\n")
+    print(summary(evalq(coef(model),data)[t<=T0]))
+    
+    phi.hat=coef(model)["phi"]
+    
+    #vcov HAC
+    var<-if(vcovfun=="vcovHAC"){
+        sandwich::vcovHAC(model)
+    }else{
+        sandwich::NeweyWest(model,prewhite=FALSE)
+    }
+    rownames(var)<-colnames(var)<-names(theta0)
+    SE<-sqrt(var["phi","phi"])
+    CI<-phi.hat+qnorm(c(.025,.975))*SE
+   
+    list(phi.hat=phi.hat,SE=SE,CI=CI,convergence=model$algoInfo$convergence,SC=NA)
+}
+
+OLS<-function(data,vcovfun=c("vcovHAC","NeweyWest")){
+    vcovfun<-match.arg(vcovfun)
+    
+    T<-data$T
+    T0<-data$T0
+    nU<-data$nU
+    t<-data$t
+    treatment<<-as.numeric(t>T0)
+    Y<<-data$Y
+    W<<-data$W
+    
+    model<-gmm(g=Y~W+treatment,x=~W+treatment,wmatrix="ident",vcov="iid")
+    cat("Parameter estimate:\n")
+    print(coef(model))
+    
+    phi.hat<-coef(model)["treatment"]
+    
+    #vcov HAC
+    var<-if(vcovfun=="vcovHAC"){
+        sandwich::vcovHAC(model)
+    }else{
+        sandwich::NeweyWest(model,prewhite=FALSE)
+    }
+    rownames(var)<-colnames(var)<-names(coef(model))
+    SE<-sqrt(var["treatment","treatment"])
+    CI<-phi.hat+qnorm(c(.025,.975))*SE
+    
+    SC<-as.numeric(cbind(1,data$W)%*%coef(model)[1:(ncol(data$W)+1)])
+    
+    list(phi.hat=phi.hat,SE=SE,CI=CI,convergence=0,SC=SC)
+}
+```
+
+## Original synthetic control
+
+```{r}
+X<-d1%>%filter(state!="Kansas")%>%select(-fips,-lngdpcapita)%>%
+    pivot_wider(names_from="state",values_from="lngdpcapita.resid")%>%
+    arrange(t)%>%select(-t)%>%as.matrix
+
+synth.out <- synth(X1=matrix(Y[t<=T0],ncol=1),
+                   X0=X[t<=T0,],
+                   Z1=matrix(Y[t<=T0],ncol=1),
+                   Z0=X[t<=T0,],
+                   method = "All")
+# synth.out
+synth.out$solution.w
+Abadie.SC<-as.numeric(X%*%synth.out$solution.w)
+(phi.hat<-mean(Y[t>T0]-Abadie.SC[t>T0]))
+```
+
+For proximal causal inference methods, I selected countries with weight $>0.1$ to be the donors.
+
+
+```{r}
+donors<-c("North Dakota","South Carolina","Texas","Washington")
+W<-d1%>%filter(state %in% donors)%>%
+    select(-fips,-lngdpcapita)%>%
+    pivot_wider(names_from="state",values_from="lngdpcapita.resid")%>%
+    arrange(t)%>%select(-t)%>%as.matrix
+Z<-d1%>%filter(!(state %in% c("Kansas",donors,excluded)))%>%
+    select(-fips,-lngdpcapita)%>%
+    pivot_wider(names_from="state",values_from="lngdpcapita.resid")%>%
+    arrange(t)%>%select(-t)%>%as.matrix
+data<-list(t=t,W=W,Z=Z,Y=Y,T=T,T0=T0)
+```
+
+## Original synthetic control with restricted donors
+
+```{r}
+synth.out <- synth(X1=matrix(Y[t<=T0],ncol=1),
+                   X0=W[t<=T0,],
+                   Z1=matrix(Y[t<=T0],ncol=1),
+                   Z0=W[t<=T0,],
+                   method = "All")
+# synth.out
+synth.out$solution.w
+Abadie.SC2<-as.numeric(W%*%synth.out$solution.w)
+(phi.hat<-mean(Y[t>T0]-Abadie.SC2[t>T0]))
+```
+
+
+## OLS
+
+```{r}
+(OLS.result<-OLS(data))
+```
+
+
+## Outcome modeling
+
+```{r}
+(h.result<-PI.h(data))
+```
+
+## Iowa in $Z$
+
+```{r}
+Z.states<-"Iowa"
+
+(DR.Iowa.result<-DR(data))
+(q.Iowa.result<-PI.q(data))
+```
+
+## Iowa & South Dakota
+
+```{r}
+Z.states<-c("South Dakota","Iowa")
+
+(DR.Iowa.SouthDakota.result<-DR(data))
+(q.Iowa.SouthDakota.result<-PI.q(data))
+```
+
+## Iowa & South Dakota & Oklahoma
+
+```{r}
+Z.states<-c("South Dakota","Iowa","Oklahoma")
+
+(DR.Iowa.SouthDakota.Oklahoma.result<-DR(data))
+(q.Iowa.SouthDakota.Oklahoma.result<-PI.q(data))
+```
+
+
+## Trajectory plot
+
+```{r}
+plot.d<-data.frame(t=data$t+t.shift)%>%
+    mutate(`Abadie's SC`=Abadie.SC2,DR=DR.Iowa.result$SC,`outcome bridge`=h.result$SC,DR2=DR.Iowa.SouthDakota.result$SC,
+           DR3=DR.Iowa.SouthDakota.Oklahoma.result$SC,
+           OLS=OLS.result$SC)%>%
+    pivot_longer(!t,names_to="method",values_to="outcome")%>%
+    arrange(method,t)%>%
+    mutate(Y=rep(data$Y,times=6))
+colors<-hue_pal()(2)
+ggplot(plot.d,aes(x=1990+t*.25,y=Y))+
+    geom_line(color=colors[1],size=1,alpha=.5)+
+    geom_line(aes(x=1990+t*.25,y=outcome),color=colors[2],linetype="longdash",size=1)+
+    geom_vline(xintercept=1990+(data$T0+t.shift)*.25,linetype="dotted")+
+    facet_wrap(~method,labeller="label_both")+
+    ylab("Detrended log GDP per capita")+xlab("Year")+
+    scale_x_continuous(breaks=seq(1990,2010,10))+theme_bw()
+ggsave("main_analysis.pdf",width=6*.8,height=4*.8)
+```
+
+
+
+
+
+
+
+
+# Placebo (Q1 2008) effect on lngdpcapita
+
+```{r}
+ts.to.include<-1:((2012-1990)*4+1)
+
+d2<-d1%>%filter(t %in% ts.to.include)
+
+Y<-d2%>%filter(state=="Kansas")%>%pull(lngdpcapita.resid)
+
+T<-length(ts.to.include)
+t<-1:T
+T0<-(2008-1990)*4+1
+```
+
+```{r}
+W<-d2%>%filter(state %in% donors)%>%
+    select(-fips,-lngdpcapita)%>%
+    pivot_wider(names_from="state",values_from="lngdpcapita.resid")%>%
+    arrange(t)%>%select(-t)%>%as.matrix
+Z<-d2%>%filter(!(state %in% c("Kansas",donors,excluded)))%>%
+    select(-fips,-lngdpcapita)%>%
+    pivot_wider(names_from="state",values_from="lngdpcapita.resid")%>%
+    arrange(t)%>%select(-t)%>%as.matrix
+data<-list(t=t,W=W,Z=Z,Y=Y,T=T,T0=T0)
+```
+
+## Original synthetic control with restricted donors
+
+```{r}
+synth.out <- synth(X1=matrix(Y[t<=T0],ncol=1),
+                   X0=W[t<=T0,],
+                   Z1=matrix(Y[t<=T0],ncol=1),
+                   Z0=W[t<=T0,],
+                   method = "All")
+# synth.out
+synth.out$solution.w
+Abadie.SC2<-as.numeric(W%*%synth.out$solution.w)
+(phi.hat<-mean(Y[t>T0]-Abadie.SC2[t>T0]))
+```
+
+## OLS
+
+```{r}
+(OLS.result<-OLS(data))
+```
+
+
+## Outcome modeling
+
+```{r}
+(h.result<-PI.h(data))
+```
+
+## Iowa in $Z$
+
+```{r}
+Z.states<-"Iowa"
+
+(DR.Iowa.result<-DR(data))
+(q.Iowa.result<-PI.q(data))
+```
+
+## Iowa & South Dakota
+
+```{r}
+Z.states<-c("South Dakota","Iowa")
+
+(DR.Iowa.SouthDakota.result<-DR(data))
+(q.Iowa.SouthDakota.result<-PI.q(data))
+```
+
+## Iowa & South Dakota & Oklahoma
+
+```{r}
+Z.states<-c("South Dakota","Iowa","Oklahoma")
+
+(DR.Iowa.SouthDakota.Oklahoma.result<-DR(data))
+(q.Iowa.SouthDakota.Oklahoma.result<-PI.q(data))
+```
+
+
+## Trajectory plot
+
+```{r}
+plot.d<-data.frame(t=data$t+t.shift)%>%
+    mutate(`Abadie's SC`=Abadie.SC2,DR=DR.Iowa.result$SC,`outcome bridge`=h.result$SC,DR2=DR.Iowa.SouthDakota.result$SC,
+           DR3=DR.Iowa.SouthDakota.Oklahoma.result$SC,
+           OLS=OLS.result$SC)%>%
+    pivot_longer(!t,names_to="method",values_to="outcome")%>%
+    arrange(method,t)%>%
+    mutate(Y=rep(data$Y,times=6))
+colors<-hue_pal()(2)
+ggplot(plot.d,aes(x=1990+t*.25,y=Y))+
+    geom_line(color=colors[1],size=1,alpha=.5)+
+    geom_line(aes(x=1990+t*.25,y=outcome),color=colors[2],linetype="longdash",size=1)+
+    geom_vline(xintercept=1990+(data$T0+t.shift)*.25,linetype="dotted")+
+    facet_wrap(~method,labeller="label_both")+
+    ylab("Detrended log GDP per capita")+xlab("Year")+
+    scale_x_continuous(breaks=seq(1990,2010,10))+theme_bw()
+ggsave("placebo_analysis.pdf",width=6*.8,height=4*.8)
+```
