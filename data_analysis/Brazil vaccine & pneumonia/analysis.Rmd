@@ -1,0 +1,582 @@
+---
+title: "Brazil vaccine 2010"
+output: pdf_document
+---
+
+
+```{r}
+knitr::opts_chunk$set(cache=TRUE)
+library(magrittr)
+suppressMessages(library(tidyverse))
+library(gmm)
+library(Synth)
+library(splines)
+library(scales)
+library(ggplot2)
+library(ggpubr)
+
+#code to install InterventionEvaluatR package to get data
+# install.packages("INLA",repos=c(getOption("repos"),INLA="https://inla.r-inla-download.org/R/stable"), dep=TRUE)
+# devtools::install_github('https://github.com/weinbergerlab/InterventionEvaluatR')
+data("pnas_brazil",package="InterventionEvaluatR")
+raw.data<-pnas_brazil
+
+raw.data$date%<>%as.Date
+raw.data%<>%filter(age_group==9,
+                   date<as.Date("2010-01-01") | date>=as.Date("2012-01-01"))%>%
+    select_if(~ !any(is.na(.)))%>%
+    select(!age_group)
+t.data<-data.frame(date=sort(unique(raw.data$date)))%>%mutate(t=1:n())
+raw.data%<>%left_join(t.data,by="date")
+#remove All nonrespiratory hospitalizations because it is an aggregate of other units
+raw.data%<>%select(!ach_noj)
+scales<-raw.data%>%summarize(across(!c(date,t),~max(.x)))
+```
+
+# Effect on pneumonia hospitalization (J12_18)
+
+```{r}
+excluded<-NULL
+d1<-raw.data%>%mutate(across(!c(date,t),~.x/max(.x)))%>%
+    pivot_longer(J12_18:Z00_99,names_to="cause",values_to="hospitalization")
+
+Y<-d1%>%filter(cause=="J12_18")%>%pull(hospitalization)
+Y.scale<-scales%>%pull("J12_18")
+
+t.shift<-0
+T<-n_distinct(d1$t)
+t<-1:T
+T0<-84
+
+
+DR<-function(data,vcovfun=c("vcovHAC","NeweyWest")){
+    vcovfun<-match.arg(vcovfun)
+    
+    T<-data$T
+    T0<-data$T0
+    t<-data$t
+    nW<-ncol(data$W)
+    nZ<-ncol(data$Z[,Z.causes,drop=FALSE])
+    
+    evalh<-function(theta,data){
+        as.numeric(cbind(1,data$W)%*%theta[1:(nW+1)])
+    }
+    evalq<-function(theta,data){
+        as.numeric(exp(cbind(1,data$Z[,Z.causes,drop=FALSE])%*%theta[(nW+2):(nW+nZ+2)]))
+    }
+    gh<-cbind(1,data$Z)
+    ngh<-ncol(gh)
+    gq<-cbind(1,data$W)
+    ngq<-ncol(gq)
+    
+    g<-function(theta,data){
+        h<-evalh(theta,data)
+        q<-evalq(theta,data)
+        
+        g1<-(t<=T0)*(data$Y-h)*gh
+        g2<-(t>T0)*(matrix(theta[(nW+nZ+3):(nW+nZ+ngq+2)],nrow=T,ncol=ngq,byrow=TRUE)-gq)
+        g3<-(t<=T0)*(q*gq-matrix(theta[(nW+nZ+3):(nW+nZ+ngq+2)],nrow=T,ncol=ngq,byrow=TRUE))
+        g4<-(t>T0)*(theta[nW+nZ+ngq+3]-(data$Y-h)+theta[nW+nZ+ngq+4])
+        g5<-(t<=T0)*(theta[nW+nZ+ngq+4]-q*(data$Y-h))
+        
+        cbind(g1,g2,g3,g4,g5)
+    }
+    
+    gradv<-function(theta,data){
+        h<-evalh(theta,data)
+        q<-evalq(theta,data)
+        
+        out<-matrix(0,ngh+2*ngq+2,nW+nZ+ngq+4)
+        
+        #g1
+        out[1:ngh,1:(nW+1)]<--t(gh)%*%(cbind(1,data$W)*(t<=T0))/T
+        
+        #g2
+        out[(ngh+1):(ngh+ngq),(nW+nZ+3):(nW+nZ+ngq+2)]<-diag((T-T0)/T,ngq)
+        
+        #g3
+        out[(ngh+ngq+1):(ngh+2*ngq),(nW+nZ+3):(nW+nZ+ngq+2)]<-diag(-T0/T,ngq)
+        M1<-t(gq)
+        M2<-q*(t<=T0)*cbind(1,data$Z[,Z.causes,drop=FALSE])/T
+        out[(ngh+ngq+1):(ngh+2*ngq),(nW+2):(nW+nZ+2)]<-M1%*%M2
+        
+        #g4
+        out[ngh+2*ngq+1,nW+nZ+ngq+3]<-out[ngh+2*ngq+1,nW+nZ+ngq+4]<-(T-T0)/T
+        out[ngh+2*ngq+1,1:(nW+1)]<-colMeans(cbind(1,data$W)*(t>T0))
+        
+        #g5
+        out[ngh+2*ngq+2,nW+nZ+ngq+4]<-T0/T
+        out[ngh+2*ngq+2,1:(nW+1)]<-colMeans(q*cbind(1,data$W)*(t<=T0))
+        out[ngh+2*ngq+2,(nW+2):(nW+nZ+2)]<-colMeans(-q*(data$Y-h)*cbind(1,data$Z[,Z.causes,drop=FALSE])*(t<=T0))
+        
+        out
+    }
+    
+    init.model.h<-lm(data$Y~.,data=as.data.frame(data$W),subset=t<=T0)
+    init.alpha<-coef(init.model.h)
+    
+    init.model.q<-glm(I(t>T0)~.,data=as.data.frame(data$Z[,Z.causes,drop=FALSE]),family=binomial())
+    init.beta<-coef(init.model.q)
+    init.beta[1]<-init.beta[1]+log((T-T0)/T0)
+    
+    init.psi<-colMeans(gq[t>T0,,drop=FALSE])
+    init.psi.minus<-mean(exp(cbind(1,data$Z[t<=T0,Z.causes,drop=FALSE])%*%init.beta)*(data$Y[t<=T0]-predict(init.model.h,newdata=as.data.frame(data$W[t<=T0,,drop=FALSE]))))
+    init.phi<-mean(data$Y[t>T0]-predict(init.model.h,newdata=as.data.frame(data$W[t>T0,,drop=FALSE])))-init.psi.minus
+    theta0<-c(init.alpha,init.beta,init.psi,init.phi,init.psi.minus)
+    
+    names(theta0)<-c(paste0("alpha",0:nW),paste0("beta",0:nZ),paste0("psi",1:ngq),"phi","psi-")
+    
+    model<-gmm(g=g,x=data,t0=theta0,gradv=gradv,wmatrix="ident",control=list(maxit=1e5),method="BFGS",vcov="iid")
+    cat("Parameter estimate:\n")
+    print(coef(model))
+    cat("Summary of estimated q(Zt):\n")
+    print(summary(evalq(coef(model),data)[t<=T0]))
+    
+    phi.hat=coef(model)["phi"]
+    
+    #vcov HAC
+    var<-if(vcovfun=="vcovHAC"){
+        sandwich::vcovHAC(model)
+    }else{
+        sandwich::NeweyWest(model,prewhite=FALSE)
+    }
+    rownames(var)<-colnames(var)<-names(theta0)
+    SE<-sqrt(var["phi","phi"])
+    CI<-phi.hat+qnorm(c(.025,.975))*SE
+    
+    SC<-evalh(coef(model),data)
+    
+    list(phi.hat=phi.hat,SE=SE,CI=CI,convergence=model$algoInfo$convergence,SC=SC)
+}
+
+PI.h<-function(data,vcovfun=c("vcovHAC","NeweyWest")){
+    vcovfun<-match.arg(vcovfun)
+    
+    T<-data$T
+    T0<-data$T0
+    t<-data$t
+    nW<-ncol(data$W)
+    
+    evalh<-function(theta,data){
+        as.numeric(cbind(1,data$W)%*%theta[1:(nW+1)])
+        # as.numeric(cbind(data$W)%*%theta[1:nW])
+    }
+    gh<-cbind(1,data$Z)
+    ngh<-ncol(gh)
+    
+    g<-function(theta,data){
+        h<-evalh(theta,data)
+        
+        g1<-T/T0*(t<=T0)*(data$Y-h)*gh
+        g2<-(t>T0)*(theta[nW+2]-(data$Y-h))
+        
+        cbind(g1,g2)
+    }
+    
+    gradv<-function(theta,data){
+        h<-evalh(theta,data)
+        
+        out<-matrix(0,ngh+1,nW+2)
+        
+        #g1
+        out[1:ngh,1:(nW+1)]<--t(gh)%*%(cbind(1,data$W)*(t<=T0))/T0
+        
+        #g2
+        out[ngh+1,nW+2]<-(T-T0)/T
+        out[ngh+1,1:(nW+1)]<-colMeans((t>T0)*cbind(1,data$W))
+        
+        out
+    }
+    
+    init.model.h<-lm(data$Y~.,data=as.data.frame(data$W),subset=t<=T0)
+    init.alpha<-coef(init.model.h)
+    init.phi<-mean(data$Y[t>T0]-predict(init.model.h,newdata=as.data.frame(data$W[t>T0,,drop=FALSE])))
+    theta0<-c(init.alpha,init.phi)
+    
+    names(theta0)<-c(paste0("alpha",0:nW),"phi")
+    
+    model<-gmm(g=g,x=data,t0=theta0,gradv=gradv,wmatrix="ident",control=list(maxit=1e5),method="BFGS",vcov="iid")
+    cat("Parameter estimate:\n")
+    print(coef(model))
+    
+    phi.hat=coef(model)["phi"]
+    
+    #vcov HAC
+    var<-if(vcovfun=="vcovHAC"){
+        sandwich::vcovHAC(model)
+    }else{
+        sandwich::NeweyWest(model,prewhite=FALSE)
+    }
+    rownames(var)<-colnames(var)<-names(theta0)
+    SE<-sqrt(var["phi","phi"])
+    CI<-phi.hat+qnorm(c(.025,.975))*SE
+    
+    SC<-evalh(coef(model),data)
+    
+    list(phi.hat=phi.hat,SE=SE,CI=CI,convergence=model$algoInfo$convergence,SC=SC)
+}
+
+
+
+PI.q<-function(data,vcovfun=c("vcovHAC","NeweyWest")){
+    vcovfun<-match.arg(vcovfun)
+    
+    T<-data$T
+    T0<-data$T0
+    t<-data$t
+    nZ<-ncol(data$Z[,Z.causes,drop=FALSE])
+    
+    evalq<-function(theta,data){
+        as.numeric(exp(cbind(1,data$Z[,Z.causes,drop=FALSE])%*%theta[1:(nZ+1)]))
+    }
+    gq<-cbind(1,data$W)
+    ngq<-ncol(gq)
+    
+    g<-function(theta,data){
+        q<-evalq(theta,data)
+        
+        g1<-(t>T0)*(matrix(theta[(nZ+2):(nZ+ngq+1)],nrow=T,ncol=ngq,byrow=TRUE)-gq)
+        g2<-(t<=T0)*(q*gq-matrix(theta[(nZ+2):(nZ+ngq+1)],nrow=T,ncol=ngq,byrow=TRUE))
+        g3<-(t>T0)*(theta[nZ+ngq+2]-data$Y+theta[nZ+ngq+3])
+        g4<-(t<=T0)*(theta[nZ+ngq+3]-q*data$Y)
+        
+        cbind(g1,g2,g3,g4)
+    }
+    
+    gradv<-function(theta,data){
+        q<-evalq(theta,data)
+        
+        out<-matrix(0,2*ngq+2,nZ+ngq+3)
+        
+        #g1
+        out[1:ngq,(nZ+2):(nZ+ngq+1)]<-diag((T-T0)/T,ngq)
+        
+        #g2
+        out[(ngq+1):(2*ngq),(nZ+2):(nZ+ngq+1)]<-diag(-T0/T,ngq)
+        M1<-t(gq)
+        M2<-q*(t<=T0)*cbind(1,data$Z[,Z.causes,drop=FALSE])/T
+        out[(ngq+1):(2*ngq),1:(nZ+1)]<-M1%*%M2
+        
+        #g3
+        out[2*ngq+1,nZ+ngq+2]<-out[2*ngq+1,nZ+ngq+3]<-(T-T0)/T
+        
+        #g4
+        out[2*ngq+2,nZ+ngq+3]<-T0/T
+        out[2*ngq+2,1:(nZ+1)]<-colMeans(-q*data$Y*cbind(1,data$Z[,Z.causes,drop=FALSE])*(t<=T0))
+        
+        out
+    }
+    
+    init.model.q<-glm(I(t>T0)~.,data=as.data.frame(data$Z[,Z.causes,drop=FALSE]),family=binomial())
+    init.beta<-coef(init.model.q)
+    init.beta[1]<-init.beta[1]+log((T-T0)/T0)
+    init.psi<-colMeans(gq[t>T0,,drop=FALSE])
+    init.psi.minus<-mean(exp(cbind(1,data$Z[t<=T0,Z.causes,drop=FALSE])%*%init.beta)*data$Y[t<=T0])
+    init.phi<-mean(data$Y[t>T0])-init.psi.minus
+    theta0<-c(init.beta,init.psi,init.phi,init.psi.minus)
+    
+    names(theta0)<-c(paste0("beta",0:nZ),paste0("psi",1:ngq),"phi","psi-")
+    
+    model<-gmm(g=g,x=data,t0=theta0,gradv=gradv,wmatrix="ident",control=list(maxit=1e5),method="BFGS",vcov="iid")
+    cat("Parameter estimate:\n")
+    print(coef(model))
+    cat("Summary of estimated q(Zt):\n")
+    print(summary(evalq(coef(model),data)[t<=T0]))
+    
+    phi.hat=coef(model)["phi"]
+    
+    #vcov HAC
+    var<-if(vcovfun=="vcovHAC"){
+        sandwich::vcovHAC(model)
+    }else{
+        sandwich::NeweyWest(model,prewhite=FALSE)
+    }
+    rownames(var)<-colnames(var)<-names(theta0)
+    SE<-sqrt(var["phi","phi"])
+    CI<-phi.hat+qnorm(c(.025,.975))*SE
+    
+    list(phi.hat=phi.hat,SE=SE,CI=CI,convergence=model$algoInfo$convergence,SC=NA)
+}
+
+OLS<-function(data,vcovfun=c("vcovHAC","NeweyWest")){
+    vcovfun<-match.arg(vcovfun)
+    
+    T<-data$T
+    T0<-data$T0
+    nU<-data$nU
+    t<-data$t
+    treatment<<-as.numeric(t>T0)
+    Y<<-data$Y
+    W<<-data$W
+    
+    model<-gmm(g=Y~W+treatment,x=~W+treatment,wmatrix="ident",vcov="iid")
+    cat("Parameter estimate:\n")
+    print(coef(model))
+    
+    phi.hat<-coef(model)["treatment"]
+    
+    #vcov HAC
+    var<-if(vcovfun=="vcovHAC"){
+        sandwich::vcovHAC(model)
+    }else{
+        sandwich::NeweyWest(model,prewhite=FALSE)
+    }
+    rownames(var)<-colnames(var)<-names(coef(model))
+    SE<-sqrt(var["treatment","treatment"])
+    CI<-phi.hat+qnorm(c(.025,.975))*SE
+    
+    #vcov iid
+    var.iid<-vcov(model)
+    rownames(var.iid)<-colnames(var.iid)<-names(coef(model))
+    SE.iid<-sqrt(var.iid["treatment","treatment"])
+    CI.iid<-phi.hat+qnorm(c(.025,.975))*SE.iid
+    
+    SC<-as.numeric(cbind(1,data$W)%*%coef(model)[1:(ncol(data$W)+1)])
+    
+    list(phi.hat=phi.hat,SE=SE,CI=CI,SE.iid=SE.iid,CI.iid=CI.iid,convergence=0,SC=SC)
+}
+```
+
+For proximal causal inference methods, I selected causes mentioned in the original paper.
+
+
+```{r}
+donors<-c("cJ20_J22","E00_99","E40_46")
+W<-d1%>%filter(cause %in% donors)%>%
+    select(-date)%>%
+    pivot_wider(names_from="cause",values_from="hospitalization")%>%
+    arrange(t)%>%select(-t)%>%as.matrix
+W.scales<-scales%>%select(all_of(colnames(W)))
+Z<-d1%>%filter(!(cause %in% c("J12_18",donors,excluded)))%>%
+    select(-date)%>%
+    pivot_wider(names_from="cause",values_from="hospitalization")%>%
+    arrange(t)%>%select(-t)%>%as.matrix
+Z.scales<-scales%>%select(all_of(colnames(Z)))
+data<-list(t=t,W=W,Z=Z,Y=Y,T=T,T0=T0)
+```
+
+## Original synthetic control with restricted donors
+
+```{r}
+synth.out <- synth(X1=matrix(Y[t<=T0],ncol=1),
+                   X0=W[t<=T0,],
+                   Z1=matrix(Y[t<=T0],ncol=1),
+                   Z0=W[t<=T0,],
+                   method = "All")
+# synth.out
+synth.out$solution.w
+Abadie.SC2<-as.numeric(W%*%synth.out$solution.w)
+(phi.hat<-mean(Y[t>T0]-Abadie.SC2[t>T0]))
+phi.hat*Y.scale
+```
+
+
+## OLS
+
+```{r}
+(OLS.result<-OLS(data))
+OLS.result$phi.hat*Y.scale
+OLS.result$CI*Y.scale
+```
+
+
+## Outcome modeling
+
+```{r}
+(h.result<-PI.h(data))
+h.result$phi.hat*Y.scale
+h.result$CI*Y.scale
+```
+
+## A10_B99_nopneumo in $Z$
+
+```{r}
+Z.causes<-"A10_B99_nopneumo"
+
+(DR.A10_B99_nopneumo.result<-DR(data))
+DR.A10_B99_nopneumo.result$phi.hat*Y.scale
+DR.A10_B99_nopneumo.result$CI*Y.scale
+
+(q.A10_B99_nopneumo.result<-PI.q(data))
+q.A10_B99_nopneumo.result$phi.hat*Y.scale
+q.A10_B99_nopneumo.result$CI*Y.scale
+```
+
+## A10_B99_nopneumo & D50_89
+
+```{r}
+Z.causes<-c("A10_B99_nopneumo","D50_89")
+
+(DR.A10_B99_nopneumo.D50_89.result<-DR(data))
+DR.A10_B99_nopneumo.D50_89.result$phi.hat*Y.scale
+DR.A10_B99_nopneumo.D50_89.result$CI*Y.scale
+
+(q.A10_B99_nopneumo.D50_89.result<-PI.q(data))
+q.A10_B99_nopneumo.D50_89.result$phi.hat*Y.scale
+q.A10_B99_nopneumo.D50_89.result$CI*Y.scale
+```
+
+## A10_B99_nopneumo & P05_07 & D50_89
+
+```{r}
+Z.causes<-c("A10_B99_nopneumo","P05_07","D50_89")
+
+(DR.A10_B99_nopneumo.P05_07.D50_89.result<-DR(data))
+DR.A10_B99_nopneumo.P05_07.D50_89.result$phi.hat*Y.scale
+DR.A10_B99_nopneumo.P05_07.D50_89.result$CI*Y.scale
+(q.A10_B99_nopneumo.P05_07.D50_89.result<-PI.q(data))
+q.A10_B99_nopneumo.P05_07.D50_89.result$phi.hat*Y.scale
+q.A10_B99_nopneumo.P05_07.D50_89.result$CI*Y.scale
+```
+
+
+## Trajectory plot
+
+```{r}
+plot.d<-data.frame(t=data$t+t.shift)%>%
+    mutate(`Abadie's SC`=Abadie.SC2*Y.scale,DR=DR.A10_B99_nopneumo.result$SC*Y.scale,`outcome bridge`=h.result$SC*Y.scale,DR2=DR.A10_B99_nopneumo.D50_89.result$SC*Y.scale,
+           DR3=DR.A10_B99_nopneumo.P05_07.D50_89.result$SC*Y.scale,
+           OLS=OLS.result$SC*Y.scale)%>%
+    pivot_longer(!t,names_to="method",values_to="outcome")%>%
+    arrange(method,t)%>%
+    mutate(Y=rep(Y*Y.scale,times=6))
+plot.d%<>%left_join(t.data,by="t")
+colors<-hue_pal()(2)
+ggplot(plot.d,aes(x=t,y=Y))+
+    geom_line(color=colors[1],alpha=.5)+
+    geom_line(aes(x=t,y=outcome),color=colors[2],linetype="longdash")+
+    geom_vline(xintercept=T0,linetype="dotted")+
+    facet_wrap(~method,labeller="label_both")+
+    ylab("Homicide Rates")+xlab("Time point index")+
+    theme_bw()
+ggsave("main_analysis.pdf",width=6*.9,height=4*.9)
+```
+
+
+
+
+
+
+
+
+# Placebo (T0=Jan 2009) effect on hospitalization
+
+```{r}
+ts.to.include<-1:84
+
+d2<-d1%>%filter(t %in% ts.to.include)
+
+Y<-d2%>%filter(cause=="J12_18")%>%pull(hospitalization)
+
+T<-length(ts.to.include)
+t<-1:T
+T0<-72
+```
+
+```{r}
+W<-d2%>%filter(cause %in% donors)%>%
+    select(-date)%>%
+    pivot_wider(names_from="cause",values_from="hospitalization")%>%
+    arrange(t)%>%select(-t)%>%as.matrix
+Z<-d2%>%filter(!(cause %in% c("J12_18",donors,excluded)))%>%
+    select(-date)%>%
+    pivot_wider(names_from="cause",values_from="hospitalization")%>%
+    arrange(t)%>%select(-t)%>%as.matrix
+data<-list(t=t,W=W,Z=Z,Y=Y,T=T,T0=T0)
+```
+
+## Original synthetic control with restricted donors
+
+```{r}
+synth.out <- synth(X1=matrix(Y[t<=T0],ncol=1),
+                   X0=W[t<=T0,],
+                   Z1=matrix(Y[t<=T0],ncol=1),
+                   Z0=W[t<=T0,],
+                   method = "All")
+# synth.out
+synth.out$solution.w
+Abadie.SC2<-as.numeric(W%*%synth.out$solution.w)
+(phi.hat<-mean(Y[t>T0]-Abadie.SC2[t>T0]))
+phi.hat*Y.scale
+```
+
+
+## OLS
+
+```{r}
+(OLS.result<-OLS(data))
+OLS.result$phi.hat*Y.scale
+OLS.result$CI*Y.scale
+```
+
+
+## Outcome modeling
+
+```{r}
+(h.result<-PI.h(data))
+h.result$phi.hat*Y.scale
+h.result$CI*Y.scale
+```
+
+## A10_B99_nopneumo in $Z$
+
+```{r}
+Z.causes<-"A10_B99_nopneumo"
+
+(DR.A10_B99_nopneumo.result<-DR(data))
+DR.A10_B99_nopneumo.result$phi.hat*Y.scale
+DR.A10_B99_nopneumo.result$CI*Y.scale
+(q.A10_B99_nopneumo.result<-PI.q(data))
+q.A10_B99_nopneumo.result$phi.hat*Y.scale
+q.A10_B99_nopneumo.result$CI*Y.scale
+```
+
+
+## A10_B99_nopneumo & D50_89
+
+```{r}
+Z.causes<-c("A10_B99_nopneumo","D50_89")
+
+(DR.A10_B99_nopneumo.D50_89.result<-DR(data))
+DR.A10_B99_nopneumo.D50_89.result$phi.hat*Y.scale
+DR.A10_B99_nopneumo.D50_89.result$CI*Y.scale
+(q.A10_B99_nopneumo.D50_89.result<-PI.q(data))
+q.A10_B99_nopneumo.D50_89.result$phi.hat*Y.scale
+q.A10_B99_nopneumo.D50_89.result$CI*Y.scale
+```
+
+## A10_B99_nopneumo & P05_07 & D50_89
+
+```{r}
+Z.causes<-c("A10_B99_nopneumo","P05_07","D50_89")
+
+(DR.A10_B99_nopneumo.P05_07.D50_89.result<-DR(data))
+DR.A10_B99_nopneumo.P05_07.D50_89.result$phi.hat*Y.scale
+DR.A10_B99_nopneumo.P05_07.D50_89.result$CI*Y.scale
+(q.A10_B99_nopneumo.P05_07.D50_89.result<-PI.q(data))
+q.A10_B99_nopneumo.P05_07.D50_89.result$phi.hat*Y.scale
+q.A10_B99_nopneumo.P05_07.D50_89.result$CI*Y.scale
+```
+
+
+## Trajectory plot
+
+```{r}
+plot.d<-data.frame(t=data$t+t.shift)%>%
+    mutate(`Abadie's SC`=Abadie.SC2*Y.scale,DR=DR.A10_B99_nopneumo.result$SC*Y.scale,`outcome bridge`=h.result$SC*Y.scale,DR2=DR.A10_B99_nopneumo.D50_89.result$SC*Y.scale,
+           DR3=DR.A10_B99_nopneumo.P05_07.D50_89.result$SC*Y.scale,
+           OLS=OLS.result$SC*Y.scale)%>%
+    pivot_longer(!t,names_to="method",values_to="outcome")%>%
+    arrange(method,t)%>%
+    mutate(Y=rep(Y*Y.scale,times=6))
+plot.d%<>%left_join(t.data,by="t")
+colors<-hue_pal()(2)
+ggplot(plot.d,aes(x=t,y=Y))+
+    geom_line(color=colors[1],alpha=.5)+
+    geom_line(aes(x=t,y=outcome),color=colors[2],linetype="longdash")+
+    geom_vline(xintercept=T0,linetype="dotted")+
+    facet_wrap(~method,labeller="label_both")+
+    ylab("Homicide Rates")+xlab("Time point index")+
+    theme_bw()
+ggsave("placebo_analysis.pdf",width=6*.9,height=4*.9)
+```
