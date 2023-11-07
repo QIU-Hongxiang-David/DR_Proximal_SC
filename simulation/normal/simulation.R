@@ -1,7 +1,7 @@
 source("generate_data.R")
 
 Ts<-c(500,1000,2000,4000)
-nUs<-c(2,3,4,5)
+nUs<-2
 sim.param<-expand.grid(T=Ts,nU=nUs)
 N<-200
 
@@ -21,49 +21,56 @@ set.seed(1737209457+job.id)
 
 results<-lapply(1:N,function(dummy){
     data<-generate.data(T,nU)
+    data2<-data
+    data2$W<-poly(data2$W,2,raw=TRUE,simple=TRUE)
+    data2$W<-apply(data2$W,2,function(x) x/max(abs(x)))
+    data2$Z<-poly(data2$Z,2,raw=TRUE,simple=TRUE)
+    data2$Z<-apply(data2$Z,2,function(x) x/max(abs(x)))
+    data2$nU<-ncol(data2$W)
+    
     correct.DR.result<-tryCatch({
-        correct.DR(data)
+        correct.DR(data2)
     },error=function(e){
         list(phi.hat=NA,SE=NA,CI=rep(NA,2),convergence=1)
     })
     correct.h.result<-tryCatch({
-        correct.h(data)
+        correct.h(data2)
     },error=function(e){
         print(e)
         list(phi.hat=NA,SE=NA,CI=rep(NA,2),convergence=1)
     })
     correct.q.result<-tryCatch({
-        correct.q(data)
+        correct.q(data2)
     },error=function(e){
         print(e)
         list(phi.hat=NA,SE=NA,CI=rep(NA,2),convergence=1)
     })
     mis.h.DR.result<-tryCatch({
-        mis.h.DR(data)
+        mis.h.DR(data2)
     },error=function(e){
         print(e)
         list(phi.hat=NA,SE=NA,CI=rep(NA,2),convergence=1)
     })
     mis.q.DR.result<-tryCatch({
-        mis.q.DR(data)
+        mis.q.DR(data2)
     },error=function(e){
         print(e)
         list(phi.hat=NA,SE=NA,CI=rep(NA,2),convergence=1)
     })
     mis.h.result<-tryCatch({
-        mis.h(data)
+        mis.h(data2)
     },error=function(e){
         print(e)
         list(phi.hat=NA,SE=NA,CI=rep(NA,2),convergence=1)
     })
     mis.q.result<-tryCatch({
-        mis.q(data)
+        mis.q(data2)
     },error=function(e){
         print(e)
         list(phi.hat=NA,SE=NA,CI=rep(NA,2),convergence=1)
     })
     OLS.result<-tryCatch({
-        OLS(data)
+        OLS(data2)
     },error=function(e){
         print(e)
         list(phi.hat=NA,SE=NA,CI=rep(NA,2),convergence=1)

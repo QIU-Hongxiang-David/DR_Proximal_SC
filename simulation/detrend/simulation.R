@@ -1,9 +1,9 @@
 source("generate_data.R")
 
 Ts<-c(500,1000,2000,4000)
-nUs<-c(2,3,4,5)
+nUs<-2
 sim.param<-expand.grid(T=Ts,nU=nUs)
-N<-200
+N<-1e3
 
 `%between%`<-function(x,y){
     y[1]<=x & x<=y[2]
@@ -21,49 +21,66 @@ set.seed(1737209457+job.id)
 
 results<-lapply(1:N,function(dummy){
     data<-generate.data(T,nU)
+    
+    d<-data.frame(cbind(data$t,data$W,data$Z))
+    names(d)<-c("t",paste0("W",1:nU),paste0("Z",1:nU))
+    d<-pivot_longer(d,cols=c(paste0("W",1:nU),paste0("Z",1:nU)),names_to="unit",values_to="outcome")
+    model<-lm(outcome~poly(t,2),data=d)
+    trend<-predict(model,newdata=data.frame(t=data$t))
+    data$W<-data$W-trend
+    data$Z<-data$Z-trend
+    data$Y<-data$Y-trend
+    
+    data2<-data
+    data2$W<-poly(data2$W,2,raw=TRUE,simple=TRUE)
+    data2$W<-apply(data2$W,2,function(x) x/max(abs(x)))
+    data2$Z<-poly(data2$Z,2,raw=TRUE,simple=TRUE)
+    data2$Z<-apply(data2$Z,2,function(x) x/max(abs(x)))
+    data2$nU<-ncol(data2$W)
+    
     correct.DR.result<-tryCatch({
-        correct.DR(data)
+        correct.DR(data2)
     },error=function(e){
         list(phi.hat=NA,SE=NA,CI=rep(NA,2),convergence=1)
     })
     correct.h.result<-tryCatch({
-        correct.h(data)
+        correct.h(data2)
     },error=function(e){
         print(e)
         list(phi.hat=NA,SE=NA,CI=rep(NA,2),convergence=1)
     })
     correct.q.result<-tryCatch({
-        correct.q(data)
+        correct.q(data2)
     },error=function(e){
         print(e)
         list(phi.hat=NA,SE=NA,CI=rep(NA,2),convergence=1)
     })
     mis.h.DR.result<-tryCatch({
-        mis.h.DR(data)
+        mis.h.DR(data2)
     },error=function(e){
         print(e)
         list(phi.hat=NA,SE=NA,CI=rep(NA,2),convergence=1)
     })
     mis.q.DR.result<-tryCatch({
-        mis.q.DR(data)
+        mis.q.DR(data2)
     },error=function(e){
         print(e)
         list(phi.hat=NA,SE=NA,CI=rep(NA,2),convergence=1)
     })
     mis.h.result<-tryCatch({
-        mis.h(data)
+        mis.h(data2)
     },error=function(e){
         print(e)
         list(phi.hat=NA,SE=NA,CI=rep(NA,2),convergence=1)
     })
     mis.q.result<-tryCatch({
-        mis.q(data)
+        mis.q(data2)
     },error=function(e){
         print(e)
         list(phi.hat=NA,SE=NA,CI=rep(NA,2),convergence=1)
     })
     OLS.result<-tryCatch({
-        OLS(data)
+        OLS(data2)
     },error=function(e){
         print(e)
         list(phi.hat=NA,SE=NA,CI=rep(NA,2),convergence=1)

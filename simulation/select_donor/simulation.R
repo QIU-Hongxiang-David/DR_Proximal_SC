@@ -1,7 +1,7 @@
 source("generate_data.R")
 
 Ts<-c(500,1000,2000,4000)
-nUs<-c(2,3,4,5)
+nUs<-2
 sim.param<-expand.grid(T=Ts,nU=nUs)
 N<-200
 
@@ -21,6 +21,24 @@ set.seed(1737209457+job.id)
 
 results<-lapply(1:N,function(dummy){
     data<-generate.data(T,nU)
+    
+    T<-data$T
+    T0<-data$T0
+    nU<-data$nU
+    t<-data$t
+    X<-cbind(data$W,data$Z)
+    
+    X1<-as.matrix(data$Y[1:T0])
+    X0<-X[1:T0,]
+    invisible(capture.output(synth.fit<-synth(X1=X1,X0=X0,Z1=X1,Z0=X0,custom.v=rep(1,T0),verbose=FALSE)))
+    w<-synth.fit$solution.w
+    
+    o<-order(w,decreasing=TRUE)
+    data$W<-X[,o[1:nU]]
+    data$Z<-X[,o[(nU+1):(2*nU)]]
+    is.correct<-setequal(o[1:2],1:2)
+    is.also.correct<-setequal(o[1:2],3:4)
+    
     correct.DR.result<-tryCatch({
         correct.DR(data)
     },error=function(e){
@@ -73,7 +91,8 @@ results<-lapply(1:N,function(dummy){
                phi.hat=c(correct.DR.result$phi.hat,correct.h.result$phi.hat,correct.q.result$phi.hat,mis.h.DR.result$phi.hat,mis.q.DR.result$phi.hat,mis.h.result$phi.hat,mis.q.result$phi.hat,OLS.result$phi.hat),
                SE=c(correct.DR.result$SE,correct.h.result$SE,correct.q.result$SE,mis.h.DR.result$SE,mis.q.DR.result$SE,mis.h.result$SE,mis.q.result$SE,OLS.result$SE),
                CI.cover=c(true.ATE %between% correct.DR.result$CI,true.ATE %between% correct.h.result$CI,true.ATE %between% correct.q.result$CI,true.ATE %between% mis.h.DR.result$CI,true.ATE %between% mis.q.DR.result$CI,true.ATE %between% mis.h.result$CI,true.ATE %between% mis.q.result$CI,true.ATE %between% OLS.result$CI),
-               convergence=c(correct.DR.result$convergence,correct.h.result$convergence,correct.q.result$convergence,mis.h.DR.result$convergence,mis.q.DR.result$convergence,mis.h.result$convergence,mis.q.result$convergence,OLS.result$convergence))
+               convergence=c(correct.DR.result$convergence,correct.h.result$convergence,correct.q.result$convergence,mis.h.DR.result$convergence,mis.q.DR.result$convergence,mis.h.result$convergence,mis.q.result$convergence,OLS.result$convergence),
+               is.correct=is.correct,is.also.correct=is.also.correct)
 })%>%bind_rows
 
 saveRDS(results,paste0("cache/",job.id,".rds"))

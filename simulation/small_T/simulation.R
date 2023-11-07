@@ -1,7 +1,7 @@
 source("generate_data.R")
 
-Ts<-c(500,1000,2000,4000)
-nUs<-c(2,3,4,5)
+Ts<-c(80,100)
+nUs<-2
 sim.param<-expand.grid(T=Ts,nU=nUs)
 N<-200
 
