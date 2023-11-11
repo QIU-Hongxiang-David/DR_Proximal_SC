@@ -2,3 +2,5 @@
 Code for "Doubly Robust Proximal Synthetic Controls"
 
 In each simulation, `generate_data.R` contains functions to generate data and make inferences; `simulation.R` runs simulations. To run simulations, submit `submit.sh` to a cluster with SGE.
+
+To run each data analysis example, run code in the R Markdown file.
